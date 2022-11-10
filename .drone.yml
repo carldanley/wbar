@@ -10,10 +10,12 @@ steps:
     CGO_ENABLED: 0
     GOOS: linux
   commands:
-  - go get
   - wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin ${GOLINTCI_VERSION}
   - golangci-lint --version
   - golangci-lint run
+  volumes:
+  - name: deps
+    path: /go
 
 - name: build-code
   image: golang:alpine
@@ -22,8 +24,15 @@ steps:
     GOOS: linux
   commands:
   - go build -a -installsuffix cgo -o wbar
+  volumes:
+  - name: deps
+    path: /go
   when:
     ref:
     - refs/tags/*
   depends_on:
   - lint-code
+
+volumes:
+- name: deps
+  temp: {}
