@@ -25,6 +25,7 @@ steps:
     CGO_ENABLED: 0
     GOOS: linux
   commands:
+  - apk add tesseract-ocr
   - go build -a -installsuffix cgo -o wbar
   volumes:
   - name: deps
