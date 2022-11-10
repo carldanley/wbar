@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	_ "image/jpeg"
 	"log"
 	"os"
 	"os/signal"

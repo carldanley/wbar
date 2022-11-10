@@ -1,16 +1,24 @@
 package pkg
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"regexp"
-	"sync"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/otiai10/gosseract/v2"
 )
 
-const SecondsToWaitAfterImageRefresh = 5
+const TimestampWidth = 500
+const TimestampHeight = 100
+const TimestampOffsetX = 570
+const TimestampOffsetY = 100
 
 func StartScanning() {
 	for {
@@ -31,26 +39,16 @@ func StartScanning() {
 		cameras := filterCamerasForConnectedAndEnabled(response)
 		log.Printf("Processing %d camera(s)...", len(cameras))
 
-		// create a new wait group for this batch of cameras
-		var wg sync.WaitGroup
-
 		// now, iterate through each camera and check it for restart
 		for _, camera := range cameras {
-			wg.Add(1)
+			err := processCamera(camera)
+			if err != nil {
+				log.Printf("Could not process camera \"%s\": %v", camera.Name, err)
+			}
 
-			go func(camera APICameraResponseCamera) {
-				defer wg.Done()
-
-				err := processCamera(camera)
-				if err != nil {
-					log.Printf("Could not process camera \"%s\": %v", camera.Name, err)
-				}
-
-				log.Printf("Processed camera: %s\n", camera.Name)
-			}(camera)
+			log.Printf("Processed camera: %s\n", camera.Name)
 		}
 
-		wg.Wait()
 		log.Println("Cameras scanned; waiting for next loop...")
 		time.Sleep(time.Second * time.Duration(GetIntervalCheckSeconds()))
 	}
@@ -69,37 +67,61 @@ func filterCamerasForConnectedAndEnabled(response APICameraResponse) []APICamera
 }
 
 func processCamera(camera APICameraResponseCamera) error {
-	log.Printf("Processing camera: %s\n", camera.Name)
+	log.Printf("[%s] Refreshing camera image\n", camera.Name)
 
-	cameraImageBytes, err := GetOrRefreshCameraImage(camera.Name, camera.GetLastImageTime())
+	cameraImageBytes, err := RefreshCameraImage(camera.Name, camera.GetLastImageTime())
 	if err != nil {
 		return fmt.Errorf("could not refresh camera image: %w", err)
 	}
 
-	// scan the image for text
-	log.Printf("Scanning camera image for text: %s\n", camera.Name)
-	log.Printf("bytes found: %d\n", len(cameraImageBytes))
+	blackedOutImage, err := blackoutNonTextOnImage(cameraImageBytes)
+	if err != nil {
+		return fmt.Errorf("could not black out non-text on image: %w", err)
+	}
 
-	text, err := scanCameraImageForText(cameraImageBytes)
+	// convert the image to a byte array
+	imageByteBuffer := new(bytes.Buffer)
+
+	err = png.Encode(imageByteBuffer, blackedOutImage)
+	if err != nil {
+		return fmt.Errorf("could not convert image to bytes: %w", err)
+	}
+
+	// scan the image for text
+	log.Printf("[%s] Scanning camera image for text\n", camera.Name)
+
+	text, err := scanCameraImageForText(imageByteBuffer.Bytes())
 	if err != nil {
 		return fmt.Errorf("could not scan camera image for text: %w", err)
 	}
 
 	// filter text out of string
-	regex := regexp.MustCompile(`\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}`)
+	regex := regexp.MustCompile(`\d{2}:\d{2}:\d{2}`)
 	foundText := regex.FindString(text)
 
-	// make sure we actually have a date
-	log.Printf("camera: %s text found: %s\n", camera.Name, foundText)
+	// house-keeping
+	log.Printf("[%s] Text found: %s\n", camera.Name, foundText)
+	duration := getTimeDifferenceFromText(foundText)
+	log.Printf("[%s] Difference of: %v\n", camera.Name, duration)
+
+	// make sure duration isn't too high
+	if duration.Seconds() >= GetMaxCameraLagSeconds() {
+		log.Printf("[%s] Restarting Camera\n", camera.Name)
+
+		err = RestartCamera(camera.Name)
+		if err != nil {
+			return fmt.Errorf("could not restart camera: %w", err)
+		}
+	}
 
 	return nil
 }
 
-func scanCameraImageForText(image []byte) (string, error) {
+func scanCameraImageForText(img []byte) (string, error) {
 	client := gosseract.NewClient()
 	defer client.Close()
 
-	err := client.SetImageFromBytes(image)
+	err := client.SetImageFromBytes(img)
 	if err != nil {
 		return "", fmt.Errorf("could not set image from bytes: %w", err)
 	}
@@ -110,4 +132,76 @@ func scanCameraImageForText(image []byte) (string, error) {
 	}
 
 	return text, nil
+}
+
+func blackoutNonTextOnImage(imageBytes []byte) (image.Image, error) {
+	const ColorValueCutoff = 210
+
+	// convert the image bytes to a go image object
+	img, _, err := image.Decode(bytes.NewReader(imageBytes))
+	if err != nil {
+		return nil, fmt.Errorf("could not decode image: %w", err)
+	}
+
+	size := img.Bounds().Size()
+	rect := image.Rect(0, 0, TimestampWidth, TimestampHeight)
+	newImage := image.NewRGBA(rect)
+
+	startX := size.X - TimestampOffsetX
+	startY := size.Y - TimestampOffsetY
+
+	// loop though all the x
+	for x := startX; x < size.X; x++ {
+		// and now loop thorough all of this x's y
+		for y := startY; y < size.Y; y++ {
+			pixel := img.At(x, y)
+			originalColor := color.RGBAModel.Convert(pixel).(color.RGBA)
+			newColor := originalColor
+
+			if (originalColor.R < ColorValueCutoff) || (originalColor.G < ColorValueCutoff) || (originalColor.B < ColorValueCutoff) {
+				newColor.R = 0
+				newColor.G = 0
+				newColor.B = 0
+			}
+
+			newImage.Set(x-startX, y-startY, newColor)
+		}
+	}
+
+	return newImage, nil
+}
+
+func getTimeDifferenceFromText(text string) time.Duration {
+	const ExpectedTimePartsLength = 3
+
+	textParts := strings.Split(text, ":")
+
+	if len(textParts) != ExpectedTimePartsLength {
+		return 0
+	}
+
+	hour, err := strconv.Atoi(textParts[0])
+	if err != nil {
+		hour = 0
+	}
+
+	minute, err := strconv.Atoi(textParts[1])
+	if err != nil {
+		minute = 0
+	}
+
+	second, err := strconv.Atoi(textParts[2])
+	if err != nil {
+		second = 0
+	}
+
+	location, err := time.LoadLocation("EST")
+	if err != nil {
+		return 0
+	}
+
+	now := time.Now()
+	then := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, second, 0, location)
+
+	return time.Since(then)
 }
