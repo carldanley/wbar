@@ -22,10 +22,11 @@ steps:
 - name: build-code
   image: golang:alpine
   environment:
-    CGO_ENABLED: 0
+    CGO_ENABLED: 1
     GOOS: linux
   commands:
   - apk add tesseract-ocr
+  - tesseract --version
   - go build -a -installsuffix cgo -o wbar
   volumes:
   - name: deps
